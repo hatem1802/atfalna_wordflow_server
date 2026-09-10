@@ -1,5 +1,21 @@
 const crypto = require('crypto');
-const { jwtSecret } = require('../controllers/authController');
+const database = require('../database');
+const { jwtSecret, ROLE_MAP } = require('../controllers/authController');
+
+/** Maps JWT/login role labels to treatment_requests.stage enum values */
+const ROLE_TO_STAGE = {
+  مستفيد: 'مستفيد',
+  Beneficiary: 'مستفيد',
+  beneficiary: 'مستفيد',
+  'باحث اجتماعي': 'باحث اجتماعي',
+  'عضو اللجنة الطبية': 'عضو لجنة طبية',
+  'رئيس اللجنة الطبية': 'رئيس لجنة طبية',
+  'امين اللجنة الطبية': 'أمين لجنة',
+  'مدير مالية': 'مالية',
+  'المدير التنفيذي': 'مدير تنفيذي',
+  'موظف استقبال': 'باحث اجتماعي',
+  'مدير النظام': 'مدير النظام'
+};
 
 function base64UrlDecode(value) {
   const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
@@ -29,32 +45,45 @@ function verifyJwt(token) {
   }
 }
 
+function roleKeyFromCapabilities(metaValue) {
+  if (!metaValue || typeof metaValue !== 'string') return null;
+  return Object.keys(ROLE_MAP).find((key) => metaValue.includes(key)) || null;
+}
+
+function isWpAdministrator(metaValue) {
+  if (!metaValue || typeof metaValue !== 'string') return false;
+  // WordPress serializes caps like: ..."administrator";b:1;...
+  return metaValue.includes('administrator');
+}
+
+const ALL_REQUESTS_ROLES = new Set(['Administrator', 'المدير التنفيذي', 'مدير النظام']);
+
+function getTokenUserId(jwtPayload) {
+  const user = jwtPayload?.user || {};
+  return user.id ?? user.ID ?? user.user_id ?? jwtPayload?.sub ?? null;
+}
+
 /**
- * Authentication middleware - verifies user is logged in
- * In a real application, this would verify JWT tokens or session
- * For this implementation, we assume req.user is set by authentication layer
- * or use a mock user ID from headers for testing
+ * Verify Bearer JWT, then load/validate the user against WordPress DB tables.
+ * Sets req.user with fresh id, email, name, role, um_custom_role_id, stage,
+ * and canViewAllRequests for elevated roles.
  */
-const authenticate = async (req, res, next) => {
+const authenticateFromDb = async (req, res, next) => {
   try {
-    // In production, this would verify JWT token
-    // For now, we support user ID from Authorization header for testing
-    // Format: Authorization: Bearer userId_roleType
     const authHeader = req.headers.authorization;
-    
+
     if (!authHeader) {
-      return res.status(401).json({ 
-        success: false, 
+      return res.status(401).json({
+        success: false,
         error: 'Authentication required',
         code: 'AUTH_REQUIRED'
       });
     }
 
-    // Parse and verify the locally issued JWT.
     const [bearer, token] = authHeader.split(' ');
     if (bearer !== 'Bearer' || !token) {
-      return res.status(401).json({ 
-        success: false, 
+      return res.status(401).json({
+        success: false,
         error: 'Invalid authorization header',
         code: 'INVALID_AUTH_HEADER'
       });
@@ -62,7 +91,119 @@ const authenticate = async (req, res, next) => {
 
     const jwtPayload = verifyJwt(token);
     if (!jwtPayload?.user) {
-      return res.status(401).json({ 
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid or expired token',
+        code: 'INVALID_TOKEN'
+      });
+    }
+
+    const userId = getTokenUserId(jwtPayload);
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        error: 'Token missing user id',
+        code: 'INVALID_TOKEN_USER'
+      });
+    }
+
+    const [rows] = await database.execute(
+      `SELECT u.ID AS id, u.user_email AS email, u.display_name AS name,
+              um.meta_value AS capabilities
+       FROM \`33fubbf_users\` u
+       LEFT JOIN \`33fubbf_usermeta\` um
+         ON um.user_id = u.ID AND um.meta_key = '33FuBbf_capabilities'
+       WHERE u.ID = ?
+       LIMIT 1`,
+      [userId]
+    );
+
+    if (!rows.length) {
+      return res.status(401).json({
+        success: false,
+        error: 'User not found',
+        code: 'USER_NOT_FOUND'
+      });
+    }
+
+    const dbUser = rows[0];
+    const roleKey = roleKeyFromCapabilities(dbUser.capabilities);
+    const isAdmin = isWpAdministrator(dbUser.capabilities);
+
+    let role;
+    let umCustomRoleId = roleKey;
+
+    if (roleKey && ROLE_MAP[roleKey]) {
+      role = ROLE_MAP[roleKey];
+    } else if (isAdmin) {
+      role = 'Administrator';
+      umCustomRoleId = null;
+    } else {
+      return res.status(403).json({
+        success: false,
+        error: 'User has no recognized role',
+        code: 'ROLE_NOT_FOUND'
+      });
+    }
+
+    // WP administrator capability elevates even when a UM role is also present
+    if (isAdmin) {
+      role = 'Administrator';
+    }
+
+    const stage = ROLE_TO_STAGE[role] || null;
+    const canViewAllRequests = ALL_REQUESTS_ROLES.has(role);
+
+    req.user = {
+      ...jwtPayload.user,
+      id: dbUser.id,
+      email: dbUser.email,
+      name: dbUser.name,
+      display_name: dbUser.name,
+      um_custom_role_id: umCustomRoleId,
+      role,
+      stage,
+      canViewAllRequests
+    };
+
+    next();
+  } catch (error) {
+    console.error('Authentication error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Authentication failed',
+      code: 'AUTH_FAILED'
+    });
+  }
+};
+
+/**
+ * Authentication middleware - verifies JWT only (no DB lookup)
+ */
+const authenticate = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader) {
+      return res.status(401).json({
+        success: false,
+        error: 'Authentication required',
+        code: 'AUTH_REQUIRED'
+      });
+    }
+
+    const [bearer, token] = authHeader.split(' ');
+    if (bearer !== 'Bearer' || !token) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid authorization header',
+        code: 'INVALID_AUTH_HEADER'
+      });
+    }
+
+    const jwtPayload = verifyJwt(token);
+    if (!jwtPayload?.user) {
+      return res.status(401).json({
         success: false,
         error: 'Invalid or expired token',
         code: 'INVALID_TOKEN'
@@ -72,8 +213,8 @@ const authenticate = async (req, res, next) => {
     next();
   } catch (error) {
     console.error('Authentication error:', error);
-    res.status(500).json({ 
-      success: false, 
+    res.status(500).json({
+      success: false,
       error: 'Authentication failed',
       code: 'AUTH_FAILED'
     });
@@ -87,18 +228,18 @@ const authenticate = async (req, res, next) => {
 const authorize = (allowedRoles) => {
   return (req, res, next) => {
     if (!req.user) {
-      return res.status(401).json({ 
-        success: false, 
+      return res.status(401).json({
+        success: false,
         error: 'Authentication required',
         code: 'AUTH_REQUIRED'
       });
     }
 
     const roles = Array.isArray(allowedRoles) ? allowedRoles : [allowedRoles];
-    
+
     if (!roles.includes(req.user.role)) {
-      return res.status(403).json({ 
-        success: false, 
+      return res.status(403).json({
+        success: false,
         error: 'Insufficient permissions',
         code: 'FORBIDDEN',
         requiredRoles: roles,
@@ -138,16 +279,16 @@ const isBeneficiary = (req, res, next) => {
  */
 const isStaff = (req, res, next) => {
   if (!req.user) {
-    return res.status(401).json({ 
-      success: false, 
+    return res.status(401).json({
+      success: false,
       error: 'Authentication required',
       code: 'AUTH_REQUIRED'
     });
   }
 
   if (req.user.role === 'مستفيد') {
-    return res.status(403).json({ 
-      success: false, 
+    return res.status(403).json({
+      success: false,
       error: 'Only staff can perform this action',
       code: 'FORBIDDEN'
     });
@@ -162,15 +303,14 @@ const isStaff = (req, res, next) => {
  */
 const verifySelfOrStaff = async (req, res, next) => {
   if (!req.user) {
-    return res.status(401).json({ 
-      success: false, 
+    return res.status(401).json({
+      success: false,
       error: 'Authentication required',
       code: 'AUTH_REQUIRED'
     });
   }
 
   if (req.user.role === 'مستفيد') {
-    // Beneficiary (مستفيد) can only access their own resources
     req.params.beneficiaryId = req.user.id;
   }
 
@@ -179,8 +319,10 @@ const verifySelfOrStaff = async (req, res, next) => {
 
 module.exports = {
   authenticate,
+  authenticateFromDb,
   authorize,
   isBeneficiary,
   isStaff,
-  verifySelfOrStaff
+  verifySelfOrStaff,
+  ROLE_TO_STAGE
 };
