@@ -1,3 +1,4 @@
+const fs = require('fs/promises');
 const database = require('../database');
 
 const requestFields = [
@@ -111,6 +112,17 @@ async function createRequest(beneficiaryId, body, files = [], context = {}) {
     };
   } catch (error) {
     await connection.rollback();
+    // Multer writes files before the transaction; remove orphans on failure
+    await Promise.all(
+      files.map(async (file) => {
+        if (!file?.path) return;
+        try {
+          await fs.unlink(file.path);
+        } catch {
+          // ignore missing/already-deleted files
+        }
+      })
+    );
     throw error;
   } finally {
     connection.release();
@@ -290,7 +302,8 @@ async function getStatuses(request, response) {
 }
 
 async function create(request, response) {
-  const result = await createRequest(request.user.id, request.body, [], {
+  const files = request.files || [];
+  const result = await createRequest(request.user.id, request.body, files, {
     userId: request.user.id,
     ipAddress: request.ip,
     device: request.get('user-agent')
@@ -310,9 +323,80 @@ async function list(request, response) {
   response.json({ success: true, data: rows });
 }
 
+/**
+ * List treatment requests for the authenticated user's workflow scope.
+ * Elevated (Administrator / المدير التنفيذي / مدير النظام): all requests + beneficiary.
+ * Beneficiary: own rows at their stage.
+ * Other staff: all requests currently at their stage.
+ */
+async function listByRole(request, response) {
+  const { role, stage, canViewAllRequests, id: userId } = request.user;
+
+  if (canViewAllRequests) {
+    const [rows] = await database.execute(
+      `SELECT
+         tr.id, tr.beneficiary_id, tr.hospital_name, tr.doctor_name, tr.diagnosis,
+         tr.disease_type, tr.treatment_cost, tr.is_urgent, tr.submission_type,
+         tr.status, tr.stage, tr.notes, tr.created_at, tr.updated_at,
+         b.source_user_id AS beneficiary_source_user_id,
+         b.beneficiary_number, b.name AS beneficiary_name, b.national_id,
+         b.nationality, b.birth_date, b.age, b.mobile AS beneficiary_mobile,
+         b.email AS beneficiary_email, b.city, b.address, b.marital_status,
+         b.family_members_count, b.income, b.iban, b.registered_at
+       FROM treatment_requests tr
+       LEFT JOIN beneficiaries b ON b.id = tr.beneficiary_id
+       ORDER BY tr.created_at DESC`
+    );
+    return response.json({
+      success: true,
+      data: rows,
+      meta: { role, scope: 'all' }
+    });
+  }
+
+  if (!stage) {
+    return response.status(403).json({
+      success: false,
+      error: 'No workflow stage mapped for this role',
+      code: 'STAGE_NOT_MAPPED',
+      role
+    });
+  }
+
+  const isBeneficiaryRole = ['مستفيد', 'beneficiary', 'Beneficiary'].includes(role);
+
+  if (isBeneficiaryRole) {
+    const [rows] = await database.execute(
+      `SELECT tr.*
+       FROM treatment_requests tr
+       INNER JOIN beneficiaries b ON b.id = tr.beneficiary_id
+       WHERE tr.stage = ? AND b.source_user_id = ?
+       ORDER BY tr.created_at DESC`,
+      [stage, userId]
+    );
+    return response.json({
+      success: true,
+      data: rows,
+      meta: { role, stage, scope: 'own_stage' }
+    });
+  }
+
+  const [rows] = await database.execute(
+    `SELECT * FROM treatment_requests
+     WHERE stage = ?
+     ORDER BY created_at DESC`,
+    [stage]
+  );
+  response.json({
+    success: true,
+    data: rows,
+    meta: { role, stage, scope: 'stage' }
+  });
+}
+
 async function getById(request, response) {
   const [rows] = await database.execute(
-    'SELECT * FROM treatment_requests WHERE id = ?',
+    'SELECT * FROM treatment_requests WHERE beneficiary_id = ?',
     [request.params.id]
   );
   if (!rows.length) return response.status(404).json({ success: false, error: 'Treatment request not found' });
@@ -361,6 +445,7 @@ module.exports = {
   getStatuses,
   create,
   list,
+  listByRole,
   getById,
   update,
   updateStatus,
