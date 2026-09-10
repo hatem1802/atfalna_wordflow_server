@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS treatment_requests (
   diagnosis TEXT NULL,
   disease_type VARCHAR(255) NULL,
   treatment_cost DECIMAL(12, 2) NULL,
-  is_urgent BOOLEAN NOT NULL DEFAULT FALSE,
+  is_urgent BOOLEAN NULL DEFAULT NULL,
   submission_type ENUM('draft', 'submit') NOT NULL DEFAULT 'draft',
   status ENUM(
     'draft',
@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS treatment_request_attachments (
 );
 
 ALTER TABLE treatment_requests ADD COLUMN IF NOT EXISTS notes TEXT NULL AFTER stage;
+ALTER TABLE treatment_requests MODIFY COLUMN is_urgent BOOLEAN NULL DEFAULT NULL;
 
 CREATE TABLE IF NOT EXISTS treatment_request_audit_logs (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,

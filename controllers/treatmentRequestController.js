@@ -6,17 +6,21 @@ const requestFields = [
 const attachmentFields = ['original_name', 'file_path', 'mime_type', 'file_size'];
 
 function normalizeBoolean(value) {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+
   return value === true || value === 'true' || value === 1 || value === '1';
 }
 
-function requestData(body) {
+function requestData(body = {}) {
   return {
     hospital_name: body.hospital_name ?? null,
     doctor_name: body.doctor_name ?? null,
     diagnosis: body.diagnosis ?? null,
     disease_type: body.disease_type ?? null,
     treatment_cost: body.treatment_cost ?? null,
-    is_urgent: normalizeBoolean(body.is_urgent)
+    is_urgent: body.is_urgent ?? false
   };
 }
 
@@ -41,7 +45,7 @@ async function addAuditLog(connection, context) {
        operation_time, ip_address, device, notes)
      VALUES (?, ?, ?, CURDATE(), CURTIME(), ?, ?, ?)`,
     [audit.requestId, audit.operationType, audit.userId, audit.ipAddress,
-      audit.device, audit.notes]
+    audit.device, audit.notes]
   );
 }
 
@@ -55,38 +59,56 @@ async function addAttachment(connection, requestId, file) {
 }
 
 async function createRequest(beneficiaryId, body, files = [], context = {}) {
-  const submissionType = body.submission_type || 'draft';
-  const isSubmit = submissionType === 'submit';
-  const missingFields = requestFields.filter((field) => {
-    return isSubmit && (body[field] === undefined || body[field] === '');
-  });
-  if (!['draft', 'submit'].includes(submissionType) || missingFields.length) {
-    const error = new Error('Invalid treatment request');
-    error.statusCode = 400;
-    error.missingFields = missingFields;
-    throw error;
-  }
+  const submissionType = 'submit';
 
   const data = requestData(body);
+
   const connection = await database.getConnection();
+
   try {
     await connection.beginTransaction();
+
     const [result] = await connection.execute(
       `INSERT INTO treatment_requests
-        (beneficiary_id, hospital_name, doctor_name, diagnosis, disease_type,
-         treatment_cost, is_urgent, submission_type, status, stage)
+        (
+          beneficiary_id,
+          hospital_name,
+          doctor_name,
+          diagnosis,
+          disease_type,
+          treatment_cost,
+          is_urgent,
+          submission_type,
+          status,
+          stage
+        )
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [beneficiaryId, ...Object.values(data), submissionType,
-        isSubmit ? 'waiting_review' : 'draft', isSubmit ? 'باحث اجتماعي' : 'مستفيد']
+      [
+        beneficiaryId,
+        ...Object.values(data),
+        submissionType,
+        'waiting_review',
+        'باحث اجتماعي'
+      ]
     );
-    for (const file of files) await addAttachment(connection, result.insertId, file);
+
+    for (const file of files) {
+      await addAttachment(connection, result.insertId, file);
+    }
+
     await addAuditLog(connection, {
       ...context,
       requestId: result.insertId,
-      operationType: context.operationType || 'CREATE_TREATMENT_REQUEST'
+      operationType:
+        context.operationType || 'CREATE_TREATMENT_REQUEST'
     });
+
     await connection.commit();
-    return { id: result.insertId, status: isSubmit ? 'waiting_review' : 'draft' };
+
+    return {
+      id: result.insertId,
+      status: 'waiting_review'
+    };
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -94,6 +116,47 @@ async function createRequest(beneficiaryId, body, files = [], context = {}) {
     connection.release();
   }
 }
+
+// async function createRequest(beneficiaryId, body, files = [], context = {}) {
+//   const submissionType = body.submission_type || 'draft';
+//   const isSubmit = submissionType === 'submit';
+//   const missingFields = requestFields.filter((field) => {
+//     return isSubmit && (body[field] === undefined || body[field] === '');
+//   });
+//   if (!['draft', 'submit'].includes(submissionType) || missingFields.length) {
+//     const error = new Error('Invalid treatment request');
+//     error.statusCode = 400;
+//     error.missingFields = missingFields;
+//     throw error;
+//   }
+
+//   const data = requestData(body);
+//   const connection = await database.getConnection();
+//   try {
+//     await connection.beginTransaction();
+//     const [result] = await connection.execute(
+//       `INSERT INTO treatment_requests
+//         (beneficiary_id, hospital_name, doctor_name, diagnosis, disease_type,
+//          treatment_cost, is_urgent, submission_type, status, stage)
+//        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+//       [beneficiaryId, ...Object.values(data), submissionType,
+//         isSubmit ? 'waiting_review' : 'draft', isSubmit ? 'باحث اجتماعي' : 'مستفيد']
+//     );
+//     for (const file of files) await addAttachment(connection, result.insertId, file);
+//     await addAuditLog(connection, {
+//       ...context,
+//       requestId: result.insertId,
+//       operationType: context.operationType || 'CREATE_TREATMENT_REQUEST'
+//     });
+//     await connection.commit();
+//     return { id: result.insertId, status: isSubmit ? 'waiting_review' : 'draft' };
+//   } catch (error) {
+//     await connection.rollback();
+//     throw error;
+//   } finally {
+//     connection.release();
+//   }
+// }
 
 async function updateRequest(requestId, body, context = {}) {
   const data = requestData(body);
