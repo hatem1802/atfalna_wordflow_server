@@ -1,15 +1,43 @@
 const express = require('express');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
 const multer = require('multer');
 const {
   authenticate,
+  authenticateFromDb,
   isBeneficiary,
   isStaff
 } = require('../middleware/auth');
 const TreatmentRequestController = require('../controllers/treatmentRequestController');
 const AttachmentController = require('../controllers/attachmentController');
 
-// Configure multer for file uploads
-const storage = multer.memoryStorage(); // Store in memory; in production, use disk storage
+const uploadDir = path.join(__dirname, '..', 'uploads', 'treatment-requests');
+fs.mkdirSync(uploadDir, { recursive: true });
+
+
+function sanitizeOwnerName(user = {}) {
+  const raw = user.display_name || user.name || user.user_nicename || 'beneficiary';
+  const cleaned = String(raw)
+    .replace(/[/\\:]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\s/g, '-');
+  return cleaned || 'beneficiary';
+}
+
+const storage = multer.diskStorage({
+  destination(_req, _file, cb) {
+    cb(null, uploadDir);
+  },
+  filename(req, file, cb) {
+    const ownerName = sanitizeOwnerName(req.user);
+    const uniqueId = crypto.randomUUID();
+    const ext = path.extname(file.originalname);
+    cb(null, `${ownerName}-${uniqueId}${ext}`);
+  }
+});
+
 const upload = multer({
   storage,
   limits: {
@@ -30,11 +58,25 @@ router.get('/statuses', authenticate, TreatmentRequestController.getStatuses);
  * Treatment Request CRUD Routes
  */
 
-// POST /api/treatment-requests - Create (مستفيد only)
-router.post('/', authenticate, isBeneficiary, TreatmentRequestController.create);
+// POST /api/treatment-requests - Create (مستفيد only) with optional files
+router.post(
+  '/',
+  authenticate,
+  isBeneficiary,
+  upload.array('files', 10),
+  TreatmentRequestController.create
+);
 
 // GET /api/treatment-requests - List (مستفيد: own only, staff: filtered)
 router.get('/', authenticate, TreatmentRequestController.list);
+
+// GET /api/treatment-requests/by-role - Requests at the user's workflow stage
+// Must be registered before /:id so "by-role" is not treated as an id
+router.get(
+  '/by-role',
+  authenticateFromDb,
+  TreatmentRequestController.listByRole
+);
 
 // GET /api/treatment-requests/:id - Get single
 router.get('/:id', authenticate, TreatmentRequestController.getById);

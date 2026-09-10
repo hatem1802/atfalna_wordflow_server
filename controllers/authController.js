@@ -142,5 +142,7 @@ async function login(request, response) {
 module.exports = {
   login,
   createJwt,
-  jwtSecret
+  jwtSecret,
+  ROLE_MAP,
+  findRoleKey
 };
