@@ -96,12 +96,12 @@ async function createRequest(beneficiaryId, body, files = [], context = {}) {
       await addAttachment(connection, result.insertId, file);
     }
 
-    await addAuditLog(connection, {
-      ...context,
-      requestId: result.insertId,
-      operationType:
-        context.operationType || 'CREATE_TREATMENT_REQUEST'
-    });
+    // await addAuditLog(connection, {
+    //   ...context,
+    //   requestId: result.insertId,
+    //   operationType:
+    //     context.operationType || 'CREATE_TREATMENT_REQUEST'
+    // });
 
     await connection.commit();
 
